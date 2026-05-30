@@ -1,0 +1,211 @@
+(* -------------------------
+   CROP-3FA ProVerif Model
+   ------------------------- *)
+
+(* Types *)
+type id.           (* identity *)
+type password.     (* user password *)
+type biometric.    (* user biometric *)
+type sigma.        (* extracted secret from biometric/PUF *)
+type tau.          (* helper data for fuzzy extractor *)
+type pid.          (* pseudo-identity *)
+type mk.           (* master key derived from PUF *)
+type sid.          (* sensor identity *)
+type nonce.        (* ephemeral nonce *)
+type timestamp.    (* timestamp for freshness *)
+type key.          (* session key *)
+type challenge.    (* PUF challenge *)
+type response.     (* PUF response *)
+
+(* Public constants *)
+free x : bitstring.                 (* base for Chebyshev map *)
+free C : bitstring.                 (* Gateway public key T_c(x) *)
+free seed_h : bitstring.            (* seed for hashing *)
+free c : bitstring [private].       (* Gateway master secret (private) *)
+
+(* Cryptographic primitives *)
+fun H(bitstring) : bitstring.       (* SHA-256 hash *)
+fun xor(bitstring, bitstring) : bitstring.
+fun chebyshev(nonce, bitstring) : bitstring.   (* T_n(x) *)
+
+(* Fuzzy extractor and PUF *)
+fun Gen(biometric) : (sigma, tau).          (* generation *)
+fun Rep(biometric, tau) : sigma.            (* reproduction *)
+fun CPUF(challenge) : response.             (* CRO-PUF response *)
+fun Rep_PUF(response, tau) : sigma.         (* reproduce from PUF response *)
+
+(* Symmetric encryption *)
+fun enc(bitstring, key) : bitstring.
+fun dec(bitstring, key) : bitstring.
+equation forall m:bitstring, k:key; dec(enc(m,k),k) = m.
+
+(* XOR self-inverse *)
+equation forall x:bitstring; xor(xor(x, y), y) = x.
+
+(* Events for authentication tracing *)
+event UserAuthenticated(id).
+event GatewayAuthenticated(id, sid).
+event SensorAuthenticated(sid).
+event SessionKeyDerived(key).
+
+(* Queries *)
+query attacker(sessionKey).                    (* Secrecy of session key *)
+query phase2; attacker(sessionKey).            (* Perfect Forward Secrecy *)
+query event(UserAuthenticated(uid)) ==> event(GatewayAuthenticated(uid, sid)).
+query event(GatewayAuthenticated(uid, sid)) ==> event(SensorAuthenticated(sid)).
+query event(SessionKeyDerived(sk)) ==> event(UserAuthenticated(uid)) && event(SensorAuthenticated(sid)).
+
+(* ------------------------------------------------------------ *)
+(* User process                                                 *)
+(* ------------------------------------------------------------ *)
+let User(uid: id, pw: password, bio: biometric,
+         pid1: pid, pid2: pid,
+         mk_i: key, tau_biometric: tau,
+         public_x: bitstring, public_C: bitstring) =
+    (* Step 1: Biometric reproduction *)
+    let sigma_biometric = Rep(bio, tau_biometric) in
+    let Bi = H((sigma_biometric, uid)) in
+
+    (* Step 2: Verify user via smart card (simplified: just check mk_i presence) *)
+    event UserAuthenticated(uid);
+
+    (* Step 3: Generate ephemeral nonce and compute Chebyshev values *)
+    new ni: nonce;
+    let A0 = chebyshev(ni, public_x) in
+    let A1 = chebyshev(ni, public_C) in
+    let A2 = xor(H(A1), pid1) in
+    let sid_j = new sid in   (* placeholder – actual sensor identity is known *)
+    let A3 = xor(A1, xor(H(mk_i), sid_j)) in
+    new t1: timestamp;
+    let A4 = H((mk_i, A0, A1, pid1, sid_j, t1)) in
+
+    (* Send Msg1 to Gateway *)
+    out(c, (A0, A2, A3, A4, t1));
+
+    (* Wait for Msg4 from Gateway *)
+    in(c, (A7_received: bitstring, A9_received: bitstring, t4_received: timestamp));
+
+    (* Verify timestamp and A9 *)
+    (* assume timestamp check passes; verify A9 *)
+    let A9_check = H((mk_i, A0, A1, A7_received, pid2, t4_received)) in
+    if A9_received = A9_check then
+        (* Compute session key *)
+        let SK = H((chebyshev(ni, A7_received), Bi, pid2, sid_j)) in
+        event SessionKeyDerived(SK);
+        (* Session key is now established *)
+        SK
+    else
+        fail.
+
+(* ------------------------------------------------------------ *)
+(* Gateway process                                              *)
+(* ------------------------------------------------------------ *)
+let Gateway(public_x: bitstring, public_C: bitstring,
+            user_pid1: pid, user_pid2: pid, user_mk: mk,
+            sensor_sid: sid, sensor_shared_key: key,
+            sensor_challenge: challenge, sensor_tau: tau) =
+
+    (* Receive Msg1 from User *)
+    in(c, (A0: bitstring, A2: bitstring, A3: bitstring, A4: bitstring, t1: timestamp));
+
+    (* Compute A1' from A0 using master secret c (abstracted) *)
+    let A1_prime = chebyshev(c, A0) in   (* since T_c(T_ni(x)) = T_{c*ni}(x) *)
+    let pid1_rec = xor(A2, H(A1_prime)) in
+    if pid1_rec = user_pid1 then
+        (* Reconstruct mk_i from PUF (simulated) *)
+        (* Actually mk_i is given as input; in reality derived via CPUF(Chai) and Rep *)
+        let sid_rec = xor(A3, xor(A1_prime, H(user_mk))) in
+        if sid_rec = sensor_sid then
+            (* Verify A4 *)
+            let A4_check = H((user_mk, A0, A1_prime, user_pid1, sensor_sid, t1)) in
+            if A4 = A4_check then
+                event GatewayAuthenticated(uid, sensor_sid);
+                (* Generate new nonce for sensor *)
+                new ng: nonce;
+                new t2: timestamp;
+                (* Compute values for sensor *)
+                let Bi = H((Rep(CPUF(user_challenge), user_tau), uid)) in  (* placeholder *)
+                let A51 = xor(Bi, H(sensor_shared_key)) in
+                let A52 = xor((ng, user_pid2), H((seed_h, sensor_shared_key))) in
+                let A5 = (A51, A52) in
+                let A6 = H((sensor_shared_key, Bi, A0, ng, user_pid2, sensor_sid, t2)) in
+                (* Send Msg2 to sensor *)
+                out(c, (A0, A5, A6, t2));
+
+                (* Receive Msg3 from sensor *)
+                in(c, (A7: bitstring, A8: bitstring, t3: timestamp));
+                (* Verify A8 *)
+                let A8_check = H((sensor_shared_key, A7, ng, t3)) in
+                if A8 = A8_check then
+                    (* Compute A9 for user *)
+                    new t4: timestamp;
+                    let A9 = H((user_mk, A0, A1_prime, A7, user_pid2, t4)) in
+                    (* Send Msg4 to user *)
+                    out(c, (A7, A9, t4))
+                else
+                    fail
+            else
+                (* Honeyword mechanism: log failure; if too many, revoke *)
+                fail
+        else fail
+    else fail.
+
+(* ------------------------------------------------------------ *)
+(* Sensor process                                               *)
+(* ------------------------------------------------------------ *)
+let Sensor(sid_j: sid, shared_key: key,
+           sensor_challenge: challenge, sensor_tau: tau,
+           public_x: bitstring) =
+
+    (* Receive Msg2 from Gateway *)
+    in(c, (A0: bitstring, A5: (bitstring, bitstring), A6: bitstring, t2: timestamp));
+
+    (* Reconstruct shared key from PUF (simulated) *)
+    (* Actually shared_key is given; in reality derived from CPUF(Chaj) and Rep *)
+    let (A51, A52) = A5 in
+    let Bi = xor(A51, H(shared_key)) in
+    let (ng_rec, pid2_rec) = xor(A52, H((seed_h, shared_key))) in
+    let A6_check = H((shared_key, Bi, A0, ng_rec, pid2_rec, sid_j, t2)) in
+    if A6 = A6_check then
+        event SensorAuthenticated(sid_j);
+        (* Generate ephemeral nonce *)
+        new ns: nonce;
+        let A7 = chebyshev(ns, public_x) in
+        let SK_s = H((chebyshev(ns, A0), Bi, pid2_rec, sid_j)) in
+        new t3: timestamp;
+        let A8 = H((shared_key, A7, ng_rec, t3)) in
+        (* Send Msg3 to Gateway *)
+        out(c, (A7, A8, t3))
+    else
+        fail.
+
+(* ------------------------------------------------------------ *)
+(* Main process – registration and parallel execution          *)
+(* ------------------------------------------------------------ *)
+process
+    (* Registration phase (secure channel) – generate long-term secrets *)
+    new uid: id;
+    new pw: password;
+    new bio: biometric;
+    (* Simulate fuzzy extractor output *)
+    let (sigma_biometric, tau_biometric) = Gen(bio) in
+    new pid1: pid;
+    new pid2: pid;
+    (* Gateway creates mk_i from PUF (simulated) *)
+    new user_challenge: challenge;
+    let user_response = CPUF(user_challenge) in
+    let (sigma_puf, tau_puf) = Gen(user_response) in   (* actually Rep with tau stored *)
+    let user_mk = H((some_gateway_secret, sigma_puf)) in
+
+    (* Sensor registration *)
+    new sid_j: sid;
+    new sensor_challenge: challenge;
+    let sensor_response = CPUF(sensor_challenge) in
+    let (sigma_sensor, tau_sensor) = Gen(sensor_response) in
+    let sensor_shared_key = H((some_gateway_secret, sigma_sensor)) in
+
+    (* Run the three parties in parallel on the public channel *)
+    ( (!User(uid, pw, bio, pid1, pid2, user_mk, tau_biometric, x, C))
+    | (!Gateway(x, C, pid1, pid2, user_mk, sid_j, sensor_shared_key, sensor_challenge, tau_sensor))
+    | (!Sensor(sid_j, sensor_shared_key, sensor_challenge, tau_sensor, x))
+    )
